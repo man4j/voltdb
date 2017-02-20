@@ -67,7 +67,6 @@ import org.voltdb.catalog.Statement;
 import org.voltdb.catalog.Table;
 import org.voltdb.common.Constants;
 import org.voltdb.common.Permission;
-import org.voltdb.compiler.deploymentfile.DrRoleType;
 import org.voltdb.compilereport.ReportMaker;
 import org.voltdb.planner.StatementPartitioning;
 import org.voltdb.settings.ClusterSettings;
@@ -590,10 +589,7 @@ public class VoltCompiler {
     }
 
     /**
-     * Internal method for compiling with and without a project.xml file or DDL files.
-     *
-     * @param projectReader Reader for project file or null if a project file is not used.
-     * @param ddlFilePaths The list of DDL files to compile (when no project is provided).
+     * Internal method for compiling DDL.
      * @param jarOutputRet The in-memory jar to populate or null if the caller doesn't provide one.
      * @return The InMemoryJarfile containing the compiled catalog if
      * successful, null if not.  If the caller provided an InMemoryJarfile, the
@@ -638,47 +634,7 @@ public class VoltCompiler {
 
         // generate the catalog report and write it to disk
         try {
-            VoltDBInterface voltdb = VoltDB.instance();
-            // try to get a catalog context
-            CatalogContext catalogContext = voltdb != null ? voltdb.getCatalogContext() : null;
-            ClusterSettings clusterSettings = catalogContext != null ? catalogContext.getClusterSettings() : null;
-            int tableCount = catalogContext != null ? catalogContext.tables.size() : 0;
-            Deployment deployment = catalogContext != null ? catalogContext.cluster.getDeployment().get("deployment") : null;
-            int hostcount = clusterSettings != null ? clusterSettings.hostcount() : 1;
-            int kfactor = deployment != null ? deployment.getKfactor() : 0;
-            int sitesPerHost = 8;
-            if  (voltdb != null && voltdb.getCatalogContext() != null) {
-                sitesPerHost =  voltdb.getCatalogContext().getNodeSettings().getLocalSitesCount();
-            }
-            boolean isPro = MiscUtils.isPro();
-
-            long minHeapRqt = RealVoltDB.computeMinimumHeapRqt(isPro, tableCount, sitesPerHost, kfactor);
-            m_report = ReportMaker.report(m_catalog, minHeapRqt, isPro, hostcount,
-                    sitesPerHost, kfactor, m_warnings, ddlWithBatchSupport);
-            m_reportPath = null;
-            File file = null;
-
-            // write to working dir when using VoltCompiler directly
-            if (standaloneCompiler) {
-                file = new File("catalog-report.html");
-            }
-            else {
-                // it's possible that standaloneCompiler will be false and catalogContext will be null
-                //   in test code.
-
-                // if we have a context, write report to voltroot
-                if (catalogContext != null) {
-                    file = new File(VoltDB.instance().getVoltDBRootPath(), "catalog-report.html");
-                }
-            }
-
-            // if there's a good place to write the report, do so
-            if (file != null) {
-                FileWriter fw = new FileWriter(file);
-                fw.write(m_report);
-                fw.close();
-                m_reportPath = file.getAbsolutePath();
-            }
+            generateCatalogReport(catalog, ddlWithBatchSupport);
         }
         catch (IOException e) {
             e.printStackTrace();
@@ -717,6 +673,50 @@ public class VoltCompiler {
         }
 
         return jarOutput;
+    }
+
+    private void generateCatalogReport(Catalog catalog, String ddlWithBatchSupport) throws IOException {
+        VoltDBInterface voltdb = VoltDB.instance();
+        // try to get a catalog context
+        CatalogContext catalogContext = voltdb != null ? voltdb.getCatalogContext() : null;
+        ClusterSettings clusterSettings = catalogContext != null ? catalogContext.getClusterSettings() : null;
+        int tableCount = catalogContext != null ? catalogContext.tables.size() : 0;
+        Deployment deployment = catalogContext != null ? catalogContext.cluster.getDeployment().get("deployment") : null;
+        int hostcount = clusterSettings != null ? clusterSettings.hostcount() : 1;
+        int kfactor = deployment != null ? deployment.getKfactor() : 0;
+        int sitesPerHost = 8;
+        if  (voltdb != null && voltdb.getCatalogContext() != null) {
+            sitesPerHost =  voltdb.getCatalogContext().getNodeSettings().getLocalSitesCount();
+        }
+        boolean isPro = MiscUtils.isPro();
+
+        long minHeapRqt = RealVoltDB.computeMinimumHeapRqt(isPro, tableCount, sitesPerHost, kfactor);
+        m_report = ReportMaker.report(catalog, minHeapRqt, isPro, hostcount,
+                sitesPerHost, kfactor, m_warnings, ddlWithBatchSupport);
+        m_reportPath = null;
+        File file = null;
+
+        // write to working dir when using VoltCompiler directly
+        if (standaloneCompiler) {
+            file = new File("catalog-report.html");
+        }
+        else {
+            // it's possible that standaloneCompiler will be false and catalogContext will be null
+            // in test code.
+
+            // if we have a context, write report to voltroot
+            if (catalogContext != null) {
+                file = new File(VoltDB.instance().getVoltDBRootPath(), "catalog-report.html");
+            }
+        }
+
+        // if there's a good place to write the report, do so
+        if (file != null) {
+            FileWriter fw = new FileWriter(file);
+            fw.write(m_report);
+            fw.close();
+            m_reportPath = file.getAbsolutePath();
+        }
     }
 
     /**
@@ -1007,7 +1007,7 @@ public class VoltCompiler {
             if (previousDBIfAny != null) {
                 previousProcsIfAny = previousDBIfAny.getProcedures();
             }
-            compileProcedures(db, hsql, allProcs, classDependencies, whichProcs, previousProcsIfAny, jarOutput);
+            compileProcedures(db, hsql, allProcs, classDependencies, whichProcs, previousProcsIfAny, jarOutput, m_catalog);
         }
 
         // add extra classes from the DDL
@@ -1093,7 +1093,8 @@ public class VoltCompiler {
                                    Collection<Class<?>> classDependencies,
                                    DdlProceduresToLoad whichProcs,
                                    CatalogMap<Procedure> prevProcsIfAny,
-                                   InMemoryJarfile jarOutput) throws VoltCompilerException
+                                   InMemoryJarfile jarOutput,
+                                   Catalog catalog) throws VoltCompilerException
     {
         // build a cache of previous SQL stmts
         m_previousCatalogStmts.clear();
@@ -1140,7 +1141,7 @@ public class VoltCompiler {
             else {
                 m_currentFilename = procedureName;
             }
-            ProcedureCompiler.compile(this, hsql, m_estimates, m_catalog, db, procedureDescriptor, jarOutput);
+            ProcedureCompiler.compile(this, hsql, m_estimates, catalog, db, procedureDescriptor, jarOutput);
         }
         // done handling files
         m_currentFilename = NO_FILENAME;
@@ -1725,7 +1726,8 @@ public class VoltCompiler {
      * @throws VoltCompilerException
      *
      */
-    public void compileInMemoryJarfileWithNewDDL(InMemoryJarfile jarfile, String newDDL, Catalog oldCatalog) throws IOException, VoltCompilerException
+    public void compileInMemoryJarfileWithNewDDL(InMemoryJarfile jarfile, String newDDL, Catalog oldCatalog)
+            throws IOException, VoltCompilerException
     {
         String oldDDL = new String(jarfile.get(VoltCompiler.AUTOGEN_DDL_FILE_NAME),
                 Constants.UTF8ENCODING);
@@ -1785,55 +1787,60 @@ public class VoltCompiler {
      * Compile the provided jarfile.  Basically, treat the jarfile as a staging area
      * for the artifacts to be included in the compile, and then compile it in place.
      *
-     * *NOTE*: Does *NOT* work with project.xml jarfiles.
-     *
      * @return the compiled catalog is contained in the provided jarfile.
-     *
      */
-    public void compileInMemoryJarfile(InMemoryJarfile jarfile) throws IOException
+    public void compileInMemoryJarfileForUpdateClasses(Catalog oldCatalog, InMemoryJarfile jarfile,
+            HSQLInterface hsql) throws IOException, VoltCompilerException
     {
-        // Gather DDL files for recompilation
-        List<VoltCompilerReader> ddlReaderList = new ArrayList<>();
-        Entry<String, byte[]> entry = jarfile.firstEntry();
-        while (entry != null) {
-            String path = entry.getKey();
-            // SOMEDAY: It would be better to have a manifest that explicitly lists
-            // ddl files instead of using a brute force *.sql glob.
-            if (path.toLowerCase().endsWith(".sql")) {
-                ddlReaderList.add(new VoltCompilerJarFileReader(jarfile, path));
-                compilerLog.trace("Added SQL file from jarfile to compilation: " + path);
-            }
-            entry = jarfile.higherEntry(entry.getKey());
-        }
-
-        // Use the in-memory jarfile-provided class loader so that procedure
-        // classes can be found and copied to the new file that gets written.
+        VoltDDLElementTracker voltDdlTracker = new VoltDDLElementTracker(this);
+        VoltCompilerReader newDDLReader = null;
         ClassLoader originalClassLoader = m_classLoader;
         try {
             m_classLoader = jarfile.getLoader();
-            // Do the compilation work.
-            InMemoryJarfile jarOut = compileInternal(null, null, ddlReaderList, jarfile);
-            // Trim the compiler output to try to provide a concise failure
-            // explanation
-            if (jarOut != null) {
-                compilerLog.debug("Successfully recompiled InMemoryJarfile");
-            }
-            else {
-                String errString = "Adhoc DDL failed";
-                if (m_errors.size() > 0) {
-                    errString = m_errors.get(m_errors.size() - 1).getLogString();
+
+            // TODO(xin): deep copy
+            Database previousDB = oldCatalog.getClusters().get("cluster").getDatabases().get("database");
+
+            Collection<ProcedureDescriptor> allProcs = voltDdlTracker.getProcedureDescriptors();
+            CatalogMap<Procedure> previousProcsIfAny = previousDB.getProcedures();
+            ArrayList<Class<?>> classDependencies = new ArrayList<>();
+
+            compileProcedures(previousDB, hsql, allProcs, classDependencies, null, previousProcsIfAny, jarfile, oldCatalog);
+
+            // produce the catalog report in html format
+            generateCatalogReport(oldCatalog, "");
+
+            final String catalogCommands = oldCatalog.serialize();
+            byte[] catalogBytes = catalogCommands.getBytes(Constants.UTF8ENCODING);
+
+            try {
+                if (!jarfile.containsKey(CatalogUtil.CATALOG_BUILDINFO_FILENAME)) {
+                    addBuildInfo(jarfile);
                 }
-                int fronttrim = errString.indexOf("DDL Error");
-                if (fronttrim < 0) { fronttrim = 0; }
-                int endtrim = errString.indexOf(" in statement starting");
-                if (endtrim < 0) { endtrim = errString.length(); }
-                String trimmed = errString.substring(fronttrim, endtrim);
-                throw new IOException(trimmed);
+                jarfile.put(CatalogUtil.CATALOG_FILENAME, catalogBytes);
+                // put the compiler report into the jarfile
+                jarfile.put("catalog-report.html", m_report.getBytes(Constants.UTF8ENCODING));
+            }
+            catch (final Exception e) {
+                e.printStackTrace();
+                return;
+            }
+
+            assert(!hasErrors());
+
+            if (hasErrors()) {
+                return;
             }
         }
         finally {
             // Restore the original class loader
             m_classLoader = originalClassLoader;
+            if (newDDLReader != null) {
+                try {
+                    newDDLReader.close();
+                }
+                catch (IOException ioe) {}
+            }
         }
     }
 

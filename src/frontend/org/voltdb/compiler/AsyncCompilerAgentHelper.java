@@ -84,8 +84,8 @@ public class AsyncCompilerAgentHelper
                     newCatalogJar = new InMemoryJarfile(work.operationBytes);
                 }
                 try {
-                    newCatalogJar = modifyCatalogClasses(oldJar, work.operationString,
-                            newCatalogJar, work.drRole == DrRoleType.XDCR);
+                    newCatalogJar = handleUpdateClasses(context.catalog, oldJar, newCatalogJar,
+                            work.operationString, work.drRole == DrRoleType.XDCR);
                 }
                 catch (IOException e) {
                     retval.errorMsg = "Unexpected IO exception @UpdateClasses modifying classes " +
@@ -265,9 +265,8 @@ public class AsyncCompilerAgentHelper
         return jarfile;
     }
 
-    private InMemoryJarfile modifyCatalogClasses(InMemoryJarfile jarfile, String deletePatterns,
-            InMemoryJarfile newJarfile, boolean isXDCR) throws IOException
-    {
+    private boolean modifyClasses(InMemoryJarfile jarfile, String deletePatterns,
+            InMemoryJarfile newJarfile) {
         // modify the old jar in place based on the @UpdateClasses inputs, and then
         // recompile it if necessary
         boolean deletedClasses = false;
@@ -287,25 +286,40 @@ public class AsyncCompilerAgentHelper
                 }
             }
             for (String classname : matcher.getMatchedClassList()) {
+                compilerLog.error("[modifyClasses: remove] remove an class: " + classname);
                 jarfile.removeClassFromJar(classname);
             }
         }
-        boolean foundClasses = false;
+        boolean addedClasses = false;
         if (newJarfile != null) {
             for (Entry<String, byte[]> e : newJarfile.entrySet()) {
                 String filename = e.getKey();
+                compilerLog.error("modifyClasses: info: new jar file name: " + filename);
+
                 if (!filename.endsWith(".class")) {
                     continue;
                 }
-                foundClasses = true;
+                addedClasses = true;
+
+                compilerLog.error("[modifyClasses: add] add a new class: " + e.getKey());
                 jarfile.put(e.getKey(), e.getValue());
             }
         }
-        if (deletedClasses || foundClasses) {
-            compilerLog.info("Updating java classes available to stored procedures");
-            VoltCompiler compiler = new VoltCompiler(isXDCR);
-            compiler.compileInMemoryJarfile(jarfile);
+        return deletedClasses || addedClasses;
+    }
+
+    private InMemoryJarfile handleUpdateClasses(Catalog currentCatalog, InMemoryJarfile jarfile,
+            InMemoryJarfile newJarfile, String deletePatterns, boolean isXDCR)
+            throws IOException, VoltCompilerException
+    {
+        boolean areClassesChanged = modifyClasses(jarfile, deletePatterns, newJarfile);
+        if (areClassesChanged) {
+             compilerLog.info("Updating java classes available to stored procedures");
+//             VoltCompiler compiler = new VoltCompiler(isXDCR);
+//             compiler.compileInMemoryJarfileForUpdateClasses(currentCatalog, jarfile,
+//                     HSQLInterface.loadHsqldb());
         }
         return jarfile;
+
     }
 }
