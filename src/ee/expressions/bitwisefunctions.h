@@ -14,10 +14,13 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with VoltDB.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <arpa/inet.h>
 #include <sstream>
 #include <string>
+#include <string.h>
 #include <limits.h>
 #include "common/NValue.hpp"
+#include "common/sysutils.hpp"
 
 namespace voltdb {
 
@@ -231,9 +234,58 @@ template<> inline NValue NValue::call<FUNC_VOLT_BIT_SHIFT_RIGHT>(const std::vect
     return getBigIntValue(result);
 }
 
-#include <arpa/inet.h>
-template<> inline NValue NValue::callUnary<FUNC_MY_INET_NTOA>() const {
-    if (getValueType() != VALUE_TYPE_BIGINT && 
+/**
+ * Convert a character to a hex value.  This
+ * seems like it should be more generally useful.
+ */
+inline uint8_t hexval(char ch)
+{
+    ch = toupper(ch);
+    if ('0' <= ch && ch <= '9') {
+        return (uint8_t)(ch - '0');
+    }
+    if ('A' <= ch && ch <= 'F') {
+        return (uint8_t)(ch - 'A' + 10);
+    }
+    throw SQLException(SQLException::data_exception_numeric_value_out_of_range,
+                       "Character is not a legal hex digit.");
+}
+
+/**
+ * Convert a hex value, 0..15, in to a hex character,
+ * 0..9 or A..F.  We always return uppper case letters.
+ * This seems like it ought to be more generally useful.
+ */
+inline char tohex(uint8_t val)
+{
+    if (0 <= val < 10) {
+        return val + '0';
+    }
+    if (10 <= val < 16) {
+        return val + 'A';
+    }
+    throw SQLException(SQLException::data_exception_numeric_value_out_of_range,
+                       "Character is not a legal hex number.");
+}
+
+/**
+ * Given a host order IPv4 or IPv6 address, return the presentation form of
+ * the address.  The single argument must have one of two types.
+ * <ul>
+ *   <li>If the argument has type BIGINT, then the lower 32 bits
+ *       of the value are interpreted as an IPv4 internet address in
+ *       host byte order.  This address is converted to presentation
+ *       format, which is the usual numbers and dots format.</li>
+ *   <li>If the argument has type VARBINARY, then the value is a
+ *       string of hexadecimal digits whose value is an IP address.
+ *       If the argument is 4 bytes long the digit string is an
+ *       IPv4 address.  If the argument is 32 bytes long, the digit
+ *       string is an IPv6 address.  Note that these lengths are twice
+ *       the size of the binary representation, since they are encoded
+ *       as hexadecimal digits.</li>
+ */
+template<> inline NValue NValue::callUnary<FUNC_INET_NTOA>() const {
+    if (getValueType() != VALUE_TYPE_BIGINT &&
         getValueType() != VALUE_TYPE_VARBINARY) {
         // The parser should enforce this for us, but just in case...
         throw SQLException(SQLException::dynamic_sql_error, "unsupported non-BigInt/VarBinary type for SQL INET_NTOA function");
@@ -244,70 +296,145 @@ template<> inline NValue NValue::callUnary<FUNC_MY_INET_NTOA>() const {
     }
     if(getValueType() == VALUE_TYPE_BIGINT){
         uint32_t v = static_cast<uint32_t> (getBigInt());
-        std::stringstream ss;
-        ss << ((v&0xff000000)>>24) << "." << ((v&0xff0000)>>16) << "."
-           << ((v&0xff00)>>8) << "." << (v&0xff) ;
-        std::string res (ss.str());
-        return getTempStringValue(res.c_str(), res.length());
+        // Room for four decimal numbers three digits long each,
+        // three dots and a trailing null.
+        const size_t INET_ADDR_SIZE = 16;
+        char iaddr_buff[INET_ADDR_SIZE];
+        iaddr_buff[INET_ADDR_SIZE - 1] = 0;
+        const char *res = inet_ntop(AF_INET, (const char *)&v, iaddr_buff, sizeof(iaddr_buff));
+        if (res != NULL) {
+            return getTempStringValue(iaddr_buff, strlen(iaddr_buff));
+        } else {
+            char errbuff[512];
+            get_sys_strerror(errno,
+                             errbuff,
+                             sizeof(errbuff),
+                             "SQL INET4_NTOA error: ");
+            throw SQLException(SQLException::dynamic_sql_error, errbuff);
+        }
     }
     if(getValueType() == VALUE_TYPE_VARBINARY){
         std::string token = toString();
         std::size_t sz = token.length();
         if(sz==8){
-            uint32_t v;
-            catalog::Catalog::hexDecodeString(token, (char *) &v);
-            std::stringstream ss;
-            ss << ((v&0xff000000)>>24) << "." << ((v&0xff0000)>>16) << "."
-               << ((v&0xff00)>>8) << "." << (v&0xff) ;
-            std::string res (ss.str());
-            return getTempStringValue(res.c_str(),res.length());
-        }else if(sz==32){
-            const size_t IPV6BINLEN = 16;
-            char ipv6bin[IPV6BINLEN];
-            char str[INET6_ADDRSTRLEN];
-
-            catalog::Catalog::hexDecodeString(toString(),ipv6bin);
-            inet_ntop(AF_INET6, ipv6bin, str, INET6_ADDRSTRLEN);
-
-            std::string res(str);
-            return getTempStringValue(res.c_str(), res.length());
+            uint32_t v = 0;
+            // Translate from the hex encoding to the
+            // binary.
+            const char *str = token.c_str();
+            for (int idx = 3; 0 <= idx; idx -= 1) {
+                uint8_t low  = hexval(str[idx*2+1]);
+                uint8_t high = hexval(str[idx*2]);
+                v += ((high << 4) | low) << idx * 8;
+            }
+            // Room for four decimal numbers three digits long each,
+            // three dots and a trailing null.
+            const size_t INET_ADDR_SIZE = 16;
+            char iaddr_buff[INET_ADDR_SIZE];
+            iaddr_buff[INET_ADDR_SIZE - 1] = 0;
+            const char *res = inet_ntop(AF_INET, (const char *)&v, iaddr_buff, sizeof(iaddr_buff));
+            if (res != NULL) {
+                return getTempStringValue(iaddr_buff, strlen(iaddr_buff));
+            } else {
+                char errbuff[512];
+                get_sys_strerror(errno,
+                                 errbuff,
+                                 sizeof(errbuff),
+                                 "SQL INET4_NTOA error: ");
+                throw SQLException(SQLException::dynamic_sql_error, errbuff);
+            }
+        } else if(sz==32) {
+            // Translate from hex encoding to binary.
+            //
+            // An IPv6 address is an array of 8 shorts, which makes
+            // it 8 * 16 = 128 bits.  If we do this in this way we
+            // keep the byte order consistent.
+            const size_t IPV6BINLEN = 8;
+            short ipv6bin[IPV6BINLEN];
+            char str[INET6_ADDRSTRLEN + 1];
+            char *token_str = token.c_str();
+            for (int idx = IPV6BINLEN-1; idx <= 0; idx -= 1) {
+                uint8_t byte0 = hexval(token_str[4 * idx + 3]);
+                uint8_t byte1 = hexval(token_str[4 * idx + 2]);
+                uint8_t byte2 = hexval(token_str[4 * idx + 1]);
+                uint8_t byte3 = hexval(token_str[4 * idx + 0]);
+                ipv6bin[idx] = byte3 << 12 + byte2 << 8 + byte1 << 4 + byte0;
+            }
+            str[INET6_ADDRSTRLEN] = 0;
+            if (inet_ntop(AF_INET6, ipv6bin, str, INET6_ADDRSTRLEN) != 0) {
+                return getTempStringValue(str, strlen(str));
+            } else {
+                char errbuff[512];
+                get_sys_strerror(errno,
+                                 errbuff,
+                                 sizeof(errbuff),
+                                 "SQL INET6_NTOA error: ");
+                throw SQLException(SQLException::dynamic_sql_error, errbuff);
+            }
         } else {
             throw SQLException(SQLException::dynamic_sql_error, "SQL INET_NTOA function requires 4 or 16 bytes with VARBINARY");
         }
     }
     return getNullStringValue();
 }
-template<> inline NValue NValue::callUnary<FUNC_MY_INET_ATON4>() const {
+
+/**
+ * Given a string representing an IPv4 address, return the
+ * address as a BIGINT value in host byte order.  If the string
+ * cannot be parsed, throw a SQLException.
+ */
+template<> inline NValue NValue::callUnary<FUNC_INET4_ATON>() const {
     if (getValueType() != VALUE_TYPE_VARCHAR) {
         throw SQLException(SQLException::dynamic_sql_error, "unsupported non-VARCHAR type for SQL INET_ATON4 function");
     }
 
     std::string token = toString();
-    // TODO check for input ipaddress string more, over octet value...
-    if (token.find('.') != std::string::npos){
-        uint32_t addr;
-        if(inet_pton(AF_INET, token.c_str(), (void*) &(addr))==1){
-            return NValue::getBigIntValue(static_cast<int64_t>(ntohl(addr)));
-        }
+    uint32_t addr;
+    // Defer validity checking to inet_pton.
+    if (inet_pton(AF_INET, token.c_str(), (void*) &(addr)) == 1) {
+        return NValue::getBigIntValue(static_cast<int64_t>(ntohl(addr)));
     }
-    throw SQLException(SQLException::dynamic_sql_error, "unrecognize ipv4 address format string");
+    char errbuff[512];
+    get_sys_strerror(errno,
+                     errbuff,
+                     sizeof(errbuff),
+                     "SQL INET4_NTOA: Unrecognized IPv4 Address Format String: ");
+    throw SQLException(SQLException::dynamic_sql_error, errbuff);
 }
-template<> inline NValue NValue::callUnary<FUNC_MY_INET_ATON6>() const {
+
+/**
+ * Given a string representing an IPv6 address, return the
+ * address as a VARBINARY.  The address will be represented as
+ * a 128 bit number.  More significant bits will appear before
+ * less significant bits in the output.
+ */
+template<> inline NValue NValue::callUnary<FUNC_INET6_ATON>() const {
     if (getValueType() != VALUE_TYPE_VARCHAR) {
         throw SQLException(SQLException::dynamic_sql_error, "unsupported non-VARCHAR type for SQL INET_ATON6 function");
     }
 
     std::string token = toString();
-    // TODO check for input ip-address string more strictly
-    if(token.find(':') != std::string::npos){
-        const size_t IPV6BINLEN = 16;
-        unsigned char addr[IPV6BINLEN];
-        if(inet_pton(AF_INET6, token.c_str(), (void*) addr)==1){
-            return NValue::getAllocatedValue(VALUE_TYPE_VARBINARY,
-                    (const char*) addr, IPV6BINLEN, getTempStringPool());
+    // Defer validity checking to inet_pton.
+    const size_t IPV6BINLEN = 8;
+    unsigned short addr[IPV6BINLEN];
+    if (inet_pton(AF_INET6, token.c_str(), (void*) addr) == 1) {
+        // Hex encode the address.
+        char hexaddr[IPV6BINLEN * 4];
+        for (int idx = IPV6BINLEN-1; 0 <= idx; idx -= 1) {
+            unsigned short s = addr[idx];
+            hexaddr[idx * 4 + 3] = tohex((s >>  0) & 0xf);
+            hexaddr[idx * 4 + 2] = tohex((s >>  4) & 0xf);
+            hexaddr[idx * 4 + 1] = tohex((s >>  8) & 0xf);
+            hexaddr[idx * 4 + 0] = tohex((s >> 12) & 0xf);
         }
+        return NValue::getAllocatedValue(VALUE_TYPE_VARBINARY,
+                (const char*)hexaddr, IPV6BINLEN * 4, getTempStringPool());
     }
-    throw SQLException(SQLException::dynamic_sql_error, "unrecognize ipv6 address format string");
+    char errbuff[512];
+    get_sys_strerror(errno,
+                     errbuff,
+                     sizeof(errbuff),
+                     "SQL INET6_NTOA: Unrecognized IPv6 Address Format String: ");
+    throw SQLException(SQLException::dynamic_sql_error, errbuff);
 }
 
 }
